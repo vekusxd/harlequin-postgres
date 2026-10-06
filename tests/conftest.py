@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from typing import Callable, Generator
 
@@ -16,7 +17,9 @@ if sys.version_info < (3, 10):
 else:
     pass
 
-TEST_DB_CONN = "postgresql://postgres:for-testing@localhost:5432"
+TEST_DB_CONN = os.environ.get(
+    "HARLEQUIN_POSTGRES_TEST_DB", "postgresql://postgres:for-testing@localhost:5432"
+)
 
 
 @pytest.fixture

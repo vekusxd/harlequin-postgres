@@ -11,6 +11,7 @@ from harlequin_postgres.interactions import (
     execute_drop_schema_statement,
     execute_drop_table_statement,
     execute_drop_view_statement,
+    execute_use_database,
     execute_use_statement,
     insert_columns_at_cursor,
     show_describe_relation,
@@ -207,7 +208,9 @@ class MaterializedViewCatalogItem(RelationCatalogItem):
     def fetch_children(self) -> list[ColumnCatalogItem]:
         if self.parent is None or self.parent.parent is None or self.connection is None:
             return []
-        result = self.connection._get_mv_cols(self.parent.label, self.label)
+        result = self.connection._get_mv_cols(
+            self.parent.parent.label, self.parent.label, self.label
+        )
         return [
             ColumnCatalogItem.from_parent(
                 parent=self,
@@ -286,7 +289,7 @@ class SchemaCatalogItem(InteractiveCatalogItem["HarlequinPostgresConnection"]):
                     )
                 )
 
-        for (mv_label,) in self.connection._get_mvs(self.label):
+        for (mv_label,) in self.connection._get_mvs(self.parent.label, self.label):
             children.append(
                 MaterializedViewCatalogItem.from_parent(
                     parent=self,
@@ -299,6 +302,7 @@ class SchemaCatalogItem(InteractiveCatalogItem["HarlequinPostgresConnection"]):
 
 class DatabaseCatalogItem(InteractiveCatalogItem["HarlequinPostgresConnection"]):
     INTERACTIONS = [
+        ("Use Database", execute_use_database),
         ("List Relations (\\d+)", show_list_objects),
         ("List Indexes (\\di+)", show_list_indexes),
         ("Drop Database", execute_drop_database_statement),
@@ -309,11 +313,13 @@ class DatabaseCatalogItem(InteractiveCatalogItem["HarlequinPostgresConnection"])
         cls, label: str, connection: "HarlequinPostgresConnection"
     ) -> "DatabaseCatalogItem":
         database_identifier = f'"{label}"'
+        # the active database is where the editor's queries run
+        is_active = label == connection.active_database
         return cls(
             qualified_identifier=database_identifier,
             query_name=database_identifier,
             label=label,
-            type_label="db",
+            type_label="db ●" if is_active else "db",
             connection=connection,
         )
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from datetime import date, datetime
 
@@ -23,7 +24,9 @@ if sys.version_info < (3, 10):
 else:
     from importlib.metadata import entry_points
 
-TEST_DB_CONN = "postgresql://postgres:for-testing@localhost:5432"
+TEST_DB_CONN = os.environ.get(
+    "HARLEQUIN_POSTGRES_TEST_DB", "postgresql://postgres:for-testing@localhost:5432"
+)
 
 
 def test_plugin_discovery() -> None:
@@ -260,7 +263,7 @@ def test_read_only_is_not_a_conn_info_option() -> None:
     adapter = HarlequinPostgresAdapter(conn_str=(TEST_DB_CONN,), read_only=True)
     assert adapter.read_only is True
     assert "read_only" not in adapter.options
-    assert adapter.connection_id == "localhost:5432/postgres"
+    assert adapter.connection_id == f"{TEST_DB_CONN.rsplit('@', 1)[-1]}/postgres"
 
     conn = adapter.connect()
     # the conninfo passed to psycopg is unchanged; read-only is applied to each

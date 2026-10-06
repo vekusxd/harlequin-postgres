@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+from collections import OrderedDict
 from itertools import cycle
 from typing import Any, Sequence
 
@@ -38,6 +40,14 @@ from harlequin_postgres.catalog import (
 from harlequin_postgres.cli_options import POSTGRES_OPTIONS
 from harlequin_postgres.completions import _get_completions
 from harlequin_postgres.loaders import register_inf_loaders
+
+MAX_OPEN_DATABASES = 5
+"""How many databases may hold a connection at once, the active one included.
+
+The catalog opens a connection to each database the user expands, since a
+Postgres connection only sees its own database's schemas. Past this many, the
+least recently used one that is not active is closed.
+"""
 
 _LIKE_ESCAPE = "\\"
 """What escapes a LIKE metacharacter in a term the caller typed."""
@@ -220,6 +230,10 @@ class HarlequinPostgresConnection(HarlequinConnection):
     ) -> None:
         self.init_message = init_message
         self.read_only = bool(read_only)
+        self._conn_str = conn_str[0] if conn_str and conn_str[0] else ""
+        self._options = options
+        self._catalog_pools: OrderedDict[str, ConnectionPool] = OrderedDict()
+        self._catalog_pools_lock = threading.Lock()
         try:
             self.conn_info = conninfo.conninfo_to_dict(
                 conninfo=conn_str[0] if conn_str else "", **options
@@ -243,17 +257,11 @@ class HarlequinPostgresConnection(HarlequinConnection):
                     "Invalid value for connection_timeout."
                 ),
             ) from e
+        self._timeout = timeout
         try:
-            self.pool: ConnectionPool = ConnectionPool(
-                conninfo=conn_str[0] if conn_str and conn_str[0] else "",
-                min_size=2,
-                max_size=5,
-                kwargs=options,
-                open=True,
-                timeout=timeout,
-                configure=self._configure_connection,
-            )
+            self.pool: ConnectionPool = self._open_pool(options)
             self._main_conn: Connection = self.pool.getconn()
+            self.active_database = self._main_conn.info.dbname
         except Exception as e:
             raise HarlequinConnectionError(
                 msg=str(e), title="Harlequin could not connect to Postgres."
@@ -277,6 +285,82 @@ class HarlequinPostgresConnection(HarlequinConnection):
             except HarlequinConnectionError:
                 self.close()
                 raise
+
+    def _open_pool(
+        self, options: dict[str, Any], min_size: int = 2, max_size: int = 5
+    ) -> ConnectionPool:
+        return ConnectionPool(
+            conninfo=self._conn_str,
+            min_size=min_size,
+            max_size=max_size,
+            kwargs=options,
+            open=True,
+            timeout=self._timeout,
+            configure=self._configure_connection,
+        )
+
+    def _pool_for(self, dbname: str) -> ConnectionPool:
+        """The pool that reads `dbname`'s catalog.
+
+        The active database's is the main pool. Any other database gets a pool
+        of one connection, opened on first use and kept for the most recently
+        used ones, so expanding a database the user is not connected to shows
+        its own schemas instead of none.
+        """
+        if dbname == self.active_database:
+            return self.pool
+        evicted: list[ConnectionPool] = []
+        with self._catalog_pools_lock:
+            pool = self._catalog_pools.get(dbname)
+            if pool is not None:
+                self._catalog_pools.move_to_end(dbname)
+                return pool
+            pool = self._open_pool(
+                {**self._options, "dbname": dbname}, min_size=0, max_size=1
+            )
+            self._catalog_pools[dbname] = pool
+            while len(self._catalog_pools) > MAX_OPEN_DATABASES - 1:
+                _, oldest = self._catalog_pools.popitem(last=False)
+                evicted.append(oldest)
+        for oldest in evicted:
+            oldest.close()
+        return pool
+
+    def use_database(self, dbname: str) -> None:
+        """Send the editor's queries, and its completions, to `dbname`.
+
+        Refuses while a Manual-mode transaction is open, so switching never
+        drops uncommitted work.
+        """
+        if dbname == self.active_database:
+            return
+        if self._main_conn.info.transaction_status != TransactionStatus.IDLE:
+            raise HarlequinQueryError(
+                msg=(
+                    "A transaction is open on "
+                    f"{self.active_database}. Commit or roll it back first."
+                ),
+                title=f"Harlequin could not switch to {dbname}.",
+            )
+        try:
+            pool = self._open_pool({**self._options, "dbname": dbname})
+            main_conn = pool.getconn()
+        except Exception as e:
+            raise HarlequinQueryError(
+                msg=str(e), title=f"Harlequin could not connect to {dbname}."
+            ) from e
+
+        old_pool, old_main_conn = self.pool, self._main_conn
+        self.pool, self._main_conn = pool, main_conn
+        self.active_database = dbname
+        self._options = {**self._options, "dbname": dbname}
+        with self._catalog_pools_lock:
+            stale = self._catalog_pools.pop(dbname, None)
+        if stale is not None:
+            stale.close()
+        old_pool.putconn(old_main_conn)
+        old_pool.close()
+        self._sync_transaction_mode()
 
     def _configure_connection(self, conn: Connection) -> None:
         """
@@ -508,6 +592,11 @@ class HarlequinPostgresConnection(HarlequinConnection):
     def close(self) -> None:
         self.pool.putconn(self._main_conn)
         self.pool.close()
+        with self._catalog_pools_lock:
+            pools = list(self._catalog_pools.values())
+            self._catalog_pools.clear()
+        for pool in pools:
+            pool.close()
 
     @property
     def transaction_mode(self) -> HarlequinTransactionMode:
@@ -561,7 +650,7 @@ class HarlequinPostgresConnection(HarlequinConnection):
         return database, set(search_path or [])
 
     def _get_schemas(self, dbname: str) -> list[tuple[str]]:
-        with self.pool.connection() as conn, conn.cursor() as cur:
+        with self._pool_for(dbname).connection() as conn, conn.cursor() as cur:
             cur.execute(
                 """
                 select schema_name
@@ -578,7 +667,7 @@ class HarlequinPostgresConnection(HarlequinConnection):
         return results
 
     def _get_relations(self, dbname: str, schema: str) -> list[tuple[str, str]]:
-        with self.pool.connection() as conn, conn.cursor() as cur:
+        with self._pool_for(dbname).connection() as conn, conn.cursor() as cur:
             cur.execute(
                 """
                 select table_name, table_type
@@ -593,9 +682,8 @@ class HarlequinPostgresConnection(HarlequinConnection):
             results: list[tuple[str, str]] = cur.fetchall()
         return results
 
-    # only works for the currently-connected db
-    def _get_mvs(self, schema: str) -> list[tuple[str]]:
-        with self.pool.connection() as conn, conn.cursor() as cur:
+    def _get_mvs(self, dbname: str, schema: str) -> list[tuple[str]]:
+        with self._pool_for(dbname).connection() as conn, conn.cursor() as cur:
             cur.execute(
                 """
                 select matviewname
@@ -612,7 +700,7 @@ class HarlequinPostgresConnection(HarlequinConnection):
     def _get_columns(
         self, dbname: str, schema: str, relation: str
     ) -> list[tuple[str, str]]:
-        with self.pool.connection() as conn, conn.cursor() as cur:
+        with self._pool_for(dbname).connection() as conn, conn.cursor() as cur:
             cur.execute(
                 """
                 select column_name, data_type
@@ -628,8 +716,8 @@ class HarlequinPostgresConnection(HarlequinConnection):
             results: list[tuple[str, str]] = cur.fetchall()
         return results
 
-    def _get_mv_cols(self, schema: str, mv: str) -> list[tuple[str, str]]:
-        with self.pool.connection() as conn, conn.cursor() as cur:
+    def _get_mv_cols(self, dbname: str, schema: str, mv: str) -> list[tuple[str, str]]:
+        with self._pool_for(dbname).connection() as conn, conn.cursor() as cur:
             cur.execute(
                 """
                 select 

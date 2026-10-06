@@ -80,6 +80,12 @@ The path is whatever this connection resolves, so setting it any of the usual wa
 harlequin -a postgres "postgres://my-user@localhost:5432/my-database?options=-csearch_path%3Danalytics,public"
 ```
 
+## Switching Databases
+
+A Postgres connection only sees its own database, so this adapter opens a separate connection for each database you expand in the Data Catalog. Every database on the server shows its schemas, relations, and columns, and up to 5 databases hold a connection at once: past that, the least recently used one is closed and reopens the next time you expand it.
+
+To run queries on another database, select it in the Data Catalog, open its context menu with `.`, and choose **Use Database**. The editor's queries and autocomplete move to that database, and the catalog marks it with `db ●`. Harlequin refuses to switch while a Manual-mode transaction is open; commit or roll it back first.
+
 ## Environment Variables
 
 Harlequin's Postgres driver will load connection information from the standard `PG*` environment variables. Any options supplied at the command-line will override environment variables.

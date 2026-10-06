@@ -33,6 +33,21 @@ def execute_use_statement(
         driver.notify(f"Editor context switched to {item.label}")
 
 
+def execute_use_database(
+    item: "DatabaseCatalogItem",
+    driver: "HarlequinDriver",
+) -> None:
+    if item.connection is None:
+        return
+    try:
+        item.connection.use_database(item.label)
+    except HarlequinQueryError as e:
+        driver.notify(e.msg, severity="error")
+    else:
+        driver.notify(f"Queries now run on {item.label}")
+        driver.refresh_catalog()
+
+
 def execute_drop_schema_statement(
     item: "SchemaCatalogItem",
     driver: "HarlequinDriver",
